@@ -945,4 +945,96 @@ mod tests {
         assert_eq!(parsed.0.node_name, header.node_name);
         assert_eq!(parsed.0.start_time, header.start_time);
     }
+
+    fn make_proc(pid: &str, value: u64, name: Option<&str>, func: &str) -> ReconProcInfo {
+        ReconProcInfo {
+            pid: pid.to_string(),
+            value,
+            registered_name: name.map(|s| s.to_string()),
+            current_function: func.to_string(),
+        }
+    }
+
+    #[test]
+    fn insert_recon_metrics_root_gauge() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        let procs = vec![
+            make_proc("<0.42.1>", 1024, Some("my_proc"), "erlang:self/0"),
+            make_proc("<0.43.1>", 512, None, "gen_server:loop/7"),
+        ];
+
+        MetricsPollerThread::insert_recon_metrics(&mut metrics, "memory", &procs);
+
+        // Root metric holds the top process's value
+        let root = metrics.items.get("recon.memory").unwrap();
+        assert!(matches!(root, MetricValue::Gauge { value: 1024, parent: None }));
+    }
+
+    #[test]
+    fn insert_recon_metrics_children_have_parent() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        let procs = vec![
+            make_proc("<0.10.0>", 2000, Some("kernel_sup"), "supervisor:loop/0"),
+            make_proc("<0.11.0>", 800, None, "gen_event:loop/1"),
+        ];
+
+        MetricsPollerThread::insert_recon_metrics(&mut metrics, "reductions", &procs);
+
+        let children: Vec<_> = metrics
+            .items
+            .iter()
+            .filter(|(_, v)| v.parent().as_ref().is_some_and(|&p| p == "recon.reductions"))
+            .collect();
+        assert_eq!(children.len(), 2);
+        for (_, v) in &children {
+            assert!(matches!(v, MetricValue::Gauge { .. }));
+        }
+    }
+
+    #[test]
+    fn insert_recon_metrics_child_names_include_pid_and_function() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        let procs = vec![make_proc("<0.99.2>", 5, None, "some_mod:some_fn/3")];
+
+        MetricsPollerThread::insert_recon_metrics(&mut metrics, "message_queue_len", &procs);
+
+        let child_key = metrics
+            .items
+            .keys()
+            .find(|k| k.contains("<0.99.2>"))
+            .expect("child metric not found");
+        assert!(child_key.contains("some_mod:some_fn/3"));
+    }
+
+    #[test]
+    fn insert_recon_metrics_registered_name_in_child_key() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+        let procs = vec![make_proc("<0.5.0>", 100, Some("init"), "init:loop/1")];
+
+        MetricsPollerThread::insert_recon_metrics(&mut metrics, "memory", &procs);
+
+        let child_key = metrics
+            .items
+            .keys()
+            .find(|k| k.contains("init"))
+            .expect("child metric not found");
+        assert!(child_key.contains("<0.5.0>"), "pid should also appear in key");
+    }
+
+    #[test]
+    fn insert_recon_metrics_empty_procs_inserts_zero_root() {
+        let start = Instant::now();
+        let mut metrics = Metrics::new(start);
+
+        MetricsPollerThread::insert_recon_metrics(&mut metrics, "memory", &[]);
+
+        let root = metrics.items.get("recon.memory").unwrap();
+        assert!(matches!(root, MetricValue::Gauge { value: 0, parent: None }));
+        // No child entries
+        assert!(!metrics.items.keys().any(|k| k != "recon.memory" && k.starts_with("recon.memory")));
+    }
 }
