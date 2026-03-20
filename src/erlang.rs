@@ -190,6 +190,17 @@ fn term_to_tuple_2nd_u64(term: Term) -> error::Result<u64> {
     term_to_u64(tuple.elements[1].clone())
 }
 
+fn term_to_pid_string(term: Term) -> error::Result<String> {
+    if let Term::Pid(pid) = term {
+        Ok(format!("<0.{}.{}>", pid.id, pid.serial))
+    } else {
+        Err(error::Error::new(format!(
+            "expected a pid, but got {}",
+            term
+        )))
+    }
+}
+
 fn term_to_u64(term: Term) -> error::Result<u64> {
     let v = match term {
         Term::FixInteger(v) => v.value.try_into()?,
@@ -303,5 +314,224 @@ impl MSAccThread {
             thread_type: thread_type.ok_or_else(|| error::Error::new("missing 'type' key"))?,
             counters,
         })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconProcInfo {
+    pub pid: String,
+    pub value: u64,
+    pub registered_name: Option<String>,
+    pub current_function: String,
+}
+
+impl ReconProcInfo {
+    fn from_term(term: Term) -> error::Result<Self> {
+        let tuple = term_to_tuple(term)?;
+        if tuple.elements.len() != 3 {
+            return Err(error::Error::new(format!(
+                "expected a 3-element tuple, but got {}",
+                tuple
+            )));
+        }
+        let pid = term_to_pid_string(tuple.elements[0].clone())?;
+        let value = term_to_u64(tuple.elements[1].clone())?;
+        let info_list = term_to_list(tuple.elements[2].clone())?;
+
+        let mut registered_name = None;
+        let mut current_function = String::new();
+
+        for elem in info_list.elements {
+            if let Ok(atom) = term_to_atom(elem.clone()) {
+                registered_name = Some(atom.name);
+                continue;
+            }
+            if let Ok(kv_tuple) = term_to_tuple(elem)
+                && kv_tuple.elements.len() == 2
+                    && let Ok(key) = term_to_atom(kv_tuple.elements[0].clone())
+                        && key.name == "current_function"
+                            && let Ok(mfa) = term_to_tuple(kv_tuple.elements[1].clone())
+                                && mfa.elements.len() == 3
+                                    && let (Ok(module), Ok(function), Ok(arity)) = (
+                                        term_to_atom(mfa.elements[0].clone()),
+                                        term_to_atom(mfa.elements[1].clone()),
+                                        term_to_u64(mfa.elements[2].clone()),
+                                    ) {
+                                        current_function =
+                                            format!("{}:{}/{}", module.name, function.name, arity);
+                                    }
+        }
+
+        Ok(Self {
+            pid,
+            value,
+            registered_name,
+            current_function,
+        })
+    }
+}
+
+pub fn format_recon_info(term: Term) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Ok(categories) = term_to_list(term) else {
+        lines.push("(unexpected format)".to_string());
+        return lines;
+    };
+    for cat_term in categories.elements {
+        let Ok(cat_tuple) = term_to_tuple(cat_term) else {
+            continue;
+        };
+        if cat_tuple.elements.len() != 2 {
+            continue;
+        }
+        let category = term_to_atom(cat_tuple.elements[0].clone())
+            .map(|a| a.name)
+            .unwrap_or_else(|_| format_term_value(&cat_tuple.elements[0]));
+        lines.push(format!("== {} ==", category));
+
+        if let Ok(items) = term_to_list(cat_tuple.elements[1].clone()) {
+            for item_term in items.elements {
+                if let Ok(kv) = term_to_tuple(item_term)
+                    && kv.elements.len() == 2 {
+                        let key = term_to_atom(kv.elements[0].clone())
+                            .map(|a| a.name)
+                            .unwrap_or_else(|_| format_term_value(&kv.elements[0]));
+                        let value = &kv.elements[1];
+
+                        if key == "current_stacktrace" {
+                            lines.push(format!("  {}:", key));
+                            format_stacktrace(value, &mut lines);
+                        } else {
+                            lines.push(format!("  {}: {}", key, format_term_value(value)));
+                        }
+                    }
+            }
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn format_stacktrace(term: &Term, lines: &mut Vec<String>) {
+    if let Ok(frames) = term_to_list(term.clone()) {
+        for frame in &frames.elements {
+            if let Ok(t) = term_to_tuple(frame.clone()) {
+                if t.elements.len() >= 3 {
+                    let module = term_to_atom(t.elements[0].clone())
+                        .map(|a| a.name)
+                        .unwrap_or_else(|_| format_term_value(&t.elements[0]));
+                    let function = term_to_atom(t.elements[1].clone())
+                        .map(|a| a.name)
+                        .unwrap_or_else(|_| format_term_value(&t.elements[1]));
+                    let arity = format_term_value(&t.elements[2]);
+
+                    let location = if t.elements.len() >= 4 {
+                        format_file_line(&t.elements[3])
+                    } else {
+                        String::new()
+                    };
+                    if location.is_empty() {
+                        lines.push(format!("    {}:{}/{}", module, function, arity));
+                    } else {
+                        lines.push(format!(
+                            "    {}:{}/{} ({})",
+                            module, function, arity, location
+                        ));
+                    }
+                } else {
+                    lines.push(format!("    {}", format_term_value(frame)));
+                }
+            } else {
+                lines.push(format!("    {}", format_term_value(frame)));
+            }
+        }
+    } else {
+        lines.push(format!("    {}", format_term_value(term)));
+    }
+}
+
+fn format_file_line(term: &Term) -> String {
+    if let Ok(props) = term_to_list(term.clone()) {
+        let mut file = None;
+        let mut line = None;
+        for prop in &props.elements {
+            if let Ok(t) = term_to_tuple(prop.clone())
+                && t.elements.len() == 2
+                    && let Ok(key) = term_to_atom(t.elements[0].clone()) {
+                        match key.name.as_str() {
+                            "file" => file = Some(format_term_value(&t.elements[1])),
+                            "line" => line = Some(format_term_value(&t.elements[1])),
+                            _ => {}
+                        }
+                    }
+        }
+        match (file, line) {
+            (Some(f), Some(l)) => format!("{}:{}", f, l),
+            (Some(f), None) => f,
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn format_term_value(term: &Term) -> String {
+    match term {
+        Term::Atom(a) => a.name.clone(),
+        Term::FixInteger(i) => i.value.to_string(),
+        Term::BigInteger(i) => i.value.to_string(),
+        Term::Float(f) => format!("{}", f.value),
+        Term::Pid(p) => format!("<0.{}.{}>", p.id, p.serial),
+        Term::Tuple(t) => {
+            if t.elements.len() == 3
+                && let (Ok(m), Ok(f), Ok(_)) = (
+                    term_to_atom(t.elements[0].clone()),
+                    term_to_atom(t.elements[1].clone()),
+                    term_to_u64(t.elements[2].clone()),
+                ) {
+                    return format!(
+                        "{}:{}/{}",
+                        m.name,
+                        f.name,
+                        format_term_value(&t.elements[2])
+                    );
+                }
+            let inner: Vec<String> = t.elements.iter().map(format_term_value).collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Term::List(l) => {
+            if l.elements.is_empty() {
+                return "[]".to_string();
+            }
+            let inner: Vec<String> = l.elements.iter().map(format_term_value).collect();
+            let joined = inner.join(", ");
+            if joined.len() > 120 {
+                let mut s = String::from("[\n");
+                for item in &inner {
+                    s.push_str(&format!("      {}\n", item));
+                }
+                s.push_str("    ]");
+                s
+            } else {
+                format!("[{}]", joined)
+            }
+        }
+        Term::Map(m) => {
+            let inner: Vec<String> = m
+                .map
+                .iter()
+                .map(|(k, v)| format!("{} => {}", format_term_value(k), format_term_value(v)))
+                .collect();
+            format!("#{{{}}}", inner.join(", "))
+        }
+        Term::Binary(b) => match String::from_utf8(b.bytes.clone()) {
+            Ok(s) => format!("<<{:?}>>", s),
+            Err(_) => format!("<<{} bytes>>", b.bytes.len()),
+        },
+        Term::ByteList(bl) => match String::from_utf8(bl.bytes.clone()) {
+            Ok(s) => format!("{:?}", s),
+            Err(_) => format!("[{} bytes]", bl.bytes.len()),
+        },
+        _ => format!("{}", term),
     }
 }
