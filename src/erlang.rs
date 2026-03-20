@@ -1,6 +1,6 @@
 use crate::error;
 use erl_dist::node::NodeName;
-use erl_dist::term::{Atom, List, Map, Term, Tuple};
+use erl_dist::term::{Atom, FixInteger, List, Map, Term, Tuple};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -151,6 +151,30 @@ impl RpcClient {
                 let value = term_to_u64(tuple.elements[1].clone())?;
                 Ok((key.name, value))
             })
+            .collect()
+    }
+
+    pub async fn get_recon_proc_count(
+        &self,
+        attribute: &str,
+        count: i32,
+    ) -> error::Result<Vec<ReconProcInfo>> {
+        let term = self
+            .handle
+            .clone()
+            .call(
+                "recon".into(),
+                "proc_count".into(),
+                List::from(vec![
+                    Atom::from(attribute).into(),
+                    FixInteger::from(count).into(),
+                ]),
+            )
+            .await?;
+        term_to_list(term)?
+            .elements
+            .into_iter()
+            .map(ReconProcInfo::from_term)
             .collect()
     }
 
