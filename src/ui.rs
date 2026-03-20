@@ -1,3 +1,4 @@
+use crate::erlang::format_recon_info;
 use crate::error;
 use crate::metrics::{Header, MetricValue, Metrics, MetricsPoller, format_u64};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -94,6 +95,7 @@ impl App {
                     }
                     log::debug!("remove old metrics");
                 }
+                self.ui.averages.retain(|_, v| v.cnt > 0);
                 self.ui.elapsed = self.ui.start.elapsed();
                 self.render_ui()?;
             }
@@ -119,6 +121,29 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> error::Result<bool> {
+        if self.ui.focus == Focus::ProcessInfo {
+            match key.code {
+                KeyCode::Char('q') => return Ok(true),
+                KeyCode::Esc | KeyCode::Left => {
+                    self.ui.focus = Focus::Sub;
+                    self.ui.process_info_lines.clear();
+                    self.ui.process_info_scroll = 0;
+                }
+                KeyCode::Up => {
+                    self.ui.process_info_scroll =
+                        self.ui.process_info_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let max_scroll = self.ui.process_info_lines.len().saturating_sub(1) as u16;
+                    self.ui.process_info_scroll =
+                        std::cmp::min(self.ui.process_info_scroll + 1, max_scroll);
+                }
+                _ => return Ok(false),
+            }
+            self.render_ui()?;
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Char('q') => {
                 return Ok(true);
@@ -146,6 +171,9 @@ impl App {
             KeyCode::Right => {
                 self.ui.focus = Focus::Sub;
             }
+            KeyCode::Enter => {
+                self.handle_enter_key()?;
+            }
             KeyCode::Up => {
                 let table = if self.ui.focus == Focus::Main {
                     &mut self.ui.metrics_table_state
@@ -172,6 +200,47 @@ impl App {
         }
         self.render_ui()?;
         Ok(false)
+    }
+
+    fn handle_enter_key(&mut self) -> error::Result<()> {
+        if self.ui.focus != Focus::Sub || self.ui.history.is_empty() {
+            return Ok(());
+        }
+
+        let (root_name, items) = self.ui.collect_detailed_items();
+        if !root_name.starts_with("recon.") {
+            return Ok(());
+        }
+
+        let selected = self.ui.detail_table_state.selected().unwrap_or(0);
+        let Some((child_key, _)) = items.into_iter().nth(selected) else {
+            return Ok(());
+        };
+
+        let Some((id, serial)) = extract_pid_from_metric_name(child_key) else {
+            return Ok(());
+        };
+
+        let Some(client) = self.poller.rpc_client() else {
+            return Ok(());
+        };
+
+        match smol::block_on(client.get_recon_info(id, serial)) {
+            Ok(term) => {
+                let display_name = child_key
+                    .strip_prefix(root_name)
+                    .and_then(|s| s.strip_prefix('.'))
+                    .unwrap_or(child_key);
+                self.ui.process_info_title = format!("recon:info {}", display_name);
+                self.ui.process_info_lines = format_recon_info(term);
+                self.ui.process_info_scroll = 0;
+                self.ui.focus = Focus::ProcessInfo;
+            }
+            Err(e) => {
+                log::warn!("recon:info failed: {e:?}");
+            }
+        }
+        Ok(())
     }
 
     fn render_ui(&mut self) -> error::Result<()> {
@@ -260,6 +329,9 @@ struct UiState {
     metrics_table_state: TableState,
     detail_table_state: TableState,
     replay_mode: bool,
+    process_info_lines: Vec<String>,
+    process_info_scroll: u16,
+    process_info_title: String,
 }
 
 impl UiState {
@@ -275,6 +347,9 @@ impl UiState {
             metrics_table_state: TableState::default(),
             detail_table_state: TableState::default(),
             replay_mode,
+            process_info_lines: Vec::new(),
+            process_info_scroll: 0,
+            process_info_title: String::new(),
         }
     }
 
@@ -321,6 +396,11 @@ impl UiState {
     }
 
     fn render_body(&mut self, f: &mut Frame, area: Rect) {
+        if self.focus == Focus::ProcessInfo {
+            self.render_process_info(f, area);
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -333,7 +413,7 @@ impl UiState {
     fn render_body_left(&mut self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(5)].as_ref())
+            .constraints([Constraint::Min(0), Constraint::Length(6)].as_ref())
             .split(area);
         self.render_metrics(f, chunks[0]);
         self.render_help(f, chunks[1]);
@@ -421,12 +501,14 @@ impl UiState {
                 Line::from("Quit:           'q' key"),
                 Line::from("Prev / Next:    'h' / 'l' keys"),
                 Line::from("Move:           UP / DOWN / LEFT / RIGHT keys"),
+                Line::from("Process Info:   ENTER (on recon process) / ESC to return"),
             ])
         } else {
             Paragraph::new(vec![
                 Line::from("Quit:           'q' key"),
                 Line::from("Pause / Resume: 'p' key"),
                 Line::from("Move:           UP / DOWN / LEFT / RIGHT keys"),
+                Line::from("Process Info:   ENTER (on recon process) / ESC to return"),
             ])
         }
         .block(self.make_block("Help"))
@@ -443,7 +525,7 @@ impl UiState {
             .0;
 
         let metric_name = match self.focus {
-            Focus::Main => root_metric_name,
+            Focus::Main | Focus::ProcessInfo => root_metric_name,
             Focus::Sub => self
                 .latest_metrics()
                 .child_items(root_metric_name)
@@ -559,7 +641,12 @@ impl UiState {
             };
             value_width = std::cmp::max(value_width, value.len());
             avg_width = std::cmp::max(avg_width, avg.len());
-            row_items.push((name.to_string(), value, avg));
+            let display_name = name
+                .strip_prefix(root_metric_name)
+                .and_then(|s| s.strip_prefix('.'))
+                .unwrap_or(name)
+                .to_string();
+            row_items.push((display_name, value, avg));
         }
 
         let rows = row_items.into_iter().map(|(name, value, avg)| {
@@ -597,6 +684,19 @@ impl UiState {
         f.render_stateful_widget(table, area, &mut self.detail_table_state);
     }
 
+    fn render_process_info(&mut self, f: &mut Frame, area: Rect) {
+        let block = self.make_block(&self.process_info_title.clone());
+        let text: Vec<Line> = self
+            .process_info_lines
+            .iter()
+            .map(|s| Line::from(s.as_str()))
+            .collect();
+        let paragraph = Paragraph::new(text)
+            .block(block)
+            .scroll((self.process_info_scroll, 0));
+        f.render_widget(paragraph, area);
+    }
+
     fn make_block(&self, name: &str) -> Block<'static> {
         Block::default().borders(Borders::ALL).title(Span::styled(
             name.to_string(),
@@ -613,6 +713,7 @@ impl UiState {
 enum Focus {
     Main,
     Sub,
+    ProcessInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -669,4 +770,15 @@ impl AvgValue {
             }
         }
     }
+}
+
+fn extract_pid_from_metric_name(name: &str) -> Option<(u32, u32)> {
+    let start = name.find("<0.")?;
+    let rest = &name[start + 3..];
+    let dot = rest.find('.')?;
+    let id: u32 = rest[..dot].parse().ok()?;
+    let rest = &rest[dot + 1..];
+    let end = rest.find('>')?;
+    let serial: u32 = rest[..end].parse().ok()?;
+    Some((id, serial))
 }
