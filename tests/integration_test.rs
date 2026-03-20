@@ -69,6 +69,21 @@ fn connect_and_poll_metrics() {
             .set_system_flag_bool("microstate_accounting", "false")
             .await?;
 
+        // recon is not loaded in the test node, so proc_count should fail
+        // gracefully (return Err) rather than panic or hang.
+        let recon_result = client.get_recon_proc_count("memory", 5).await;
+        assert!(
+            recon_result.is_err(),
+            "expected recon:proc_count/2 to fail when recon is not loaded"
+        );
+
+        // recon:info/1 should likewise fail gracefully
+        let info_result = client.get_recon_info(0, 0).await;
+        assert!(
+            info_result.is_err(),
+            "expected recon:info/1 to fail when recon is not loaded"
+        );
+
         Ok::<_, erldash::error::Error>(())
     });
 

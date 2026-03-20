@@ -517,7 +517,7 @@ fn format_file_line(term: &Term) -> String {
     }
 }
 
-fn format_term_value(term: &Term) -> String {
+pub(crate) fn format_term_value(term: &Term) -> String {
     match term {
         Term::Atom(a) => a.name.clone(),
         Term::FixInteger(i) => i.value.to_string(),
@@ -575,5 +575,180 @@ fn format_term_value(term: &Term) -> String {
             Err(_) => format!("[{} bytes]", bl.bytes.len()),
         },
         _ => format!("{}", term),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use erl_dist::term::{Pid as ErlPid, Term};
+
+    fn make_pid(id: u32, serial: u32) -> Term {
+        ErlPid::new("nonode@nohost".to_string(), id, serial, 0).into()
+    }
+
+    fn make_mfa(module: &str, function: &str, arity: i32) -> Term {
+        Tuple::from(vec![
+            Atom::from(module).into(),
+            Atom::from(function).into(),
+            FixInteger::from(arity).into(),
+        ])
+        .into()
+    }
+
+    fn make_recon_proc(
+        id: u32,
+        serial: u32,
+        value: i32,
+        reg_name: Option<&str>,
+        mfa: (&str, &str, i32),
+    ) -> Term {
+        let mut info_elems: Vec<Term> = Vec::new();
+        if let Some(name) = reg_name {
+            info_elems.push(Atom::from(name).into());
+        }
+        let current_fn_kv = Tuple::from(vec![
+            Atom::from("current_function").into(),
+            make_mfa(mfa.0, mfa.1, mfa.2),
+        ]);
+        info_elems.push(current_fn_kv.into());
+        Tuple::from(vec![
+            make_pid(id, serial),
+            FixInteger::from(value).into(),
+            List::from(info_elems).into(),
+        ])
+        .into()
+    }
+
+    // --- term_to_pid_string ---
+
+    #[test]
+    fn pid_string_format() {
+        assert_eq!(
+            term_to_pid_string(make_pid(42, 7)).unwrap(),
+            "<0.42.7>"
+        );
+    }
+
+    #[test]
+    fn pid_string_rejects_non_pid() {
+        assert!(term_to_pid_string(Atom::from("not_a_pid").into()).is_err());
+    }
+
+    // --- ReconProcInfo::from_term ---
+
+    #[test]
+    fn recon_proc_info_named_process() {
+        let term = make_recon_proc(42, 1, 1024, Some("my_proc"), ("erlang", "self", 0));
+        let info = ReconProcInfo::from_term(term).unwrap();
+        assert_eq!(info.pid, "<0.42.1>");
+        assert_eq!(info.value, 1024);
+        assert_eq!(info.registered_name, Some("my_proc".to_string()));
+        assert_eq!(info.current_function, "erlang:self/0");
+    }
+
+    #[test]
+    fn recon_proc_info_unnamed_process() {
+        let term = make_recon_proc(100, 5, 512, None, ("gen_server", "loop", 7));
+        let info = ReconProcInfo::from_term(term).unwrap();
+        assert_eq!(info.pid, "<0.100.5>");
+        assert_eq!(info.value, 512);
+        assert_eq!(info.registered_name, None);
+        assert_eq!(info.current_function, "gen_server:loop/7");
+    }
+
+    #[test]
+    fn recon_proc_info_rejects_wrong_arity_tuple() {
+        let bad = Tuple::from(vec![make_pid(1, 0), FixInteger::from(0i32).into()]);
+        assert!(ReconProcInfo::from_term(bad.into()).is_err());
+    }
+
+    // --- format_term_value ---
+
+    #[test]
+    fn format_term_value_atom() {
+        assert_eq!(format_term_value(&Atom::from("hello").into()), "hello");
+    }
+
+    #[test]
+    fn format_term_value_integer() {
+        assert_eq!(
+            format_term_value(&FixInteger::from(42i32).into()),
+            "42"
+        );
+    }
+
+    #[test]
+    fn format_term_value_pid() {
+        assert_eq!(format_term_value(&make_pid(42, 7)), "<0.42.7>");
+    }
+
+    #[test]
+    fn format_term_value_mfa_tuple() {
+        let mfa = make_mfa("erlang", "self", 0);
+        assert_eq!(format_term_value(&mfa), "erlang:self/0");
+    }
+
+    #[test]
+    fn format_term_value_generic_tuple() {
+        let t = Tuple::from(vec![
+            Atom::from("a").into(),
+            Atom::from("b").into(),
+        ]);
+        assert_eq!(format_term_value(&t.into()), "{a, b}");
+    }
+
+    #[test]
+    fn format_term_value_empty_list() {
+        assert_eq!(format_term_value(&List::nil().into()), "[]");
+    }
+
+    // --- format_recon_info ---
+
+    #[test]
+    fn format_recon_info_single_category() {
+        let mem_kv = Tuple::from(vec![
+            Atom::from("memory").into(),
+            FixInteger::from(1024i32).into(),
+        ]);
+        let bin_kv = Tuple::from(vec![
+            Atom::from("binary").into(),
+            FixInteger::from(512i32).into(),
+        ]);
+        let items = List::from(vec![mem_kv.into(), bin_kv.into()]);
+        let cat = Tuple::from(vec![Atom::from("memory_info").into(), items.into()]);
+        let top = List::from(vec![cat.into()]);
+
+        let lines = format_recon_info(top.into());
+        assert!(lines.contains(&"== memory_info ==".to_string()));
+        assert!(lines.contains(&"  memory: 1024".to_string()));
+        assert!(lines.contains(&"  binary: 512".to_string()));
+    }
+
+    #[test]
+    fn format_recon_info_stacktrace() {
+        let frame = Tuple::from(vec![
+            Atom::from("erlang").into(),
+            Atom::from("apply").into(),
+            FixInteger::from(2i32).into(),
+            List::nil().into(),
+        ]);
+        let stacktrace_kv = Tuple::from(vec![
+            Atom::from("current_stacktrace").into(),
+            List::from(vec![frame.into()]).into(),
+        ]);
+        let items = List::from(vec![stacktrace_kv.into()]);
+        let cat = Tuple::from(vec![Atom::from("meta").into(), items.into()]);
+        let top = List::from(vec![cat.into()]);
+
+        let lines = format_recon_info(top.into());
+        assert!(lines.iter().any(|l| l.contains("current_stacktrace")));
+        assert!(lines.iter().any(|l| l.contains("erlang:apply/2")));
+    }
+
+    #[test]
+    fn format_recon_info_invalid_input() {
+        let lines = format_recon_info(Atom::from("not_a_list").into());
+        assert_eq!(lines, vec!["(unexpected format)"]);
     }
 }
