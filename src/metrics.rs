@@ -1,4 +1,4 @@
-use crate::erlang::{MSAccThread, RpcClient, SystemVersion};
+use crate::erlang::{MSAccThread, ReconProcInfo, RpcClient, SystemVersion};
 use crate::error::{self, Context};
 use crate::{Command, ReplayArgs, RunArgs};
 use nojson::DisplayJson;
@@ -356,6 +356,13 @@ impl MetricsPoller {
         }
     }
 
+    pub fn rpc_client(&self) -> Option<&RpcClient> {
+        match self {
+            Self::Realtime(poller) => Some(&poller.rpc_client),
+            Self::Replay(_) => None,
+        }
+    }
+
     pub fn poll_metrics(&self, timeout: Duration) -> Result<Metrics, mpsc::RecvTimeoutError> {
         match self {
             Self::Realtime(poller) => poller.rx.recv_timeout(timeout),
@@ -506,6 +513,7 @@ struct MetricsPollerThread {
     start: Instant,
     header: Header,
     record_file: Option<File>,
+    recon_available: bool,
 }
 
 impl MetricsPollerThread {
@@ -554,6 +562,7 @@ impl MetricsPollerThread {
                 start,
                 header,
                 record_file,
+                recon_available: true,
             }
             .run()
         });
@@ -660,6 +669,46 @@ impl MetricsPollerThread {
         }
     }
 
+    fn insert_recon_metrics(
+        metrics: &mut Metrics,
+        attribute: &str,
+        procs: &[ReconProcInfo],
+    ) {
+        let root_name = format!("recon.{attribute}");
+        let top_value = procs.first().map(|p| p.value).unwrap_or(0);
+        metrics.insert(&root_name, MetricValue::gauge(top_value));
+
+        let width = if procs.len() >= 10 { 2 } else { 1 };
+        for (i, proc_info) in procs.iter().enumerate() {
+            let rank = i + 1;
+            let name_part = if let Some(ref reg) = proc_info.registered_name {
+                format!("{reg} {}", proc_info.pid)
+            } else {
+                proc_info.pid.clone()
+            };
+            let child_name = if proc_info.current_function.is_empty() {
+                format!("{root_name}.{rank:0width$} {name_part}")
+            } else {
+                format!(
+                    "{root_name}.{rank:0width$} {name_part} {}",
+                    proc_info.current_function
+                )
+            };
+            metrics.insert(
+                &child_name,
+                MetricValue::gauge_with_parent(proc_info.value, &root_name),
+            );
+        }
+    }
+
+    async fn poll_recon(&self, metrics: &mut Metrics) -> error::Result<()> {
+        for attribute in &["memory", "reductions", "message_queue_len"] {
+            let procs = self.rpc_client.get_recon_proc_count(attribute, 10).await?;
+            Self::insert_recon_metrics(metrics, attribute, &procs);
+        }
+        Ok(())
+    }
+
     async fn poll_once(&mut self) -> error::Result<Metrics> {
         let mut metrics = Metrics::new(self.start);
 
@@ -751,6 +800,12 @@ impl MetricsPollerThread {
                 MetricValue::gauge_with_parent(v, "memory.total_bytes"),
             );
         }
+
+        if self.recon_available
+            && let Err(e) = self.poll_recon(&mut metrics).await {
+                log::warn!("recon:proc_count/2 failed (disabling recon): {e:?}");
+                self.recon_available = false;
+            }
 
         self.rpc_client
             .set_system_flag_bool("microstate_accounting", "reset")
