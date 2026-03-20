@@ -154,6 +154,24 @@ impl RpcClient {
             .collect()
     }
 
+    pub async fn get_recon_info(&self, id: u32, serial: u32) -> error::Result<Term> {
+        let pid_tuple = Tuple::from(vec![
+            FixInteger::from(0i32).into(),
+            FixInteger::from(id as i32).into(),
+            FixInteger::from(serial as i32).into(),
+        ]);
+        let term = self
+            .handle
+            .clone()
+            .call(
+                "recon".into(),
+                "info".into(),
+                List::from(vec![pid_tuple.into()]),
+            )
+            .await?;
+        Ok(term)
+    }
+
     pub async fn get_recon_proc_count(
         &self,
         attribute: &str,
