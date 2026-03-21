@@ -13,6 +13,14 @@ So you can use this dashboard out of the box without installing any additional p
 
 Metrics are collected using [`erlang:statistics/1`], [`erlang:memory/0`] and [`erlang:system_info/1`] functions.
 
+If the well-known [recon] library is present on the Erlang node,
+additional functionality is available, including dynamic lists of top
+processes by message queue length, reductions, or memory usage.
+Additionally, a given process can be inspected, using `recon:info/1`
+functionality. See the [recon] docs for further information.
+
+[recon]: https://ferd.github.io/recon/overview.html
+
 ![erldash demo](erldash.gif)
 
 [the dynamic node name feature]: https://www.erlang.org/blog/otp-23-highlights/#dynamic-node-name

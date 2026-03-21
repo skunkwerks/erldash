@@ -1,8 +1,8 @@
 [package]
 name = "erldash"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
-authors = ["Takeru Ohta <phjgt308@gmail.com>"]
+authors = ["Takeru Ohta <phjgt308@gmail.com>", "Dave Cottlehuber <dch@skunkwerks.at>"]
 license = "MIT OR Apache-2.0"
 description = "A simple, terminal-based Erlang dashboard"
 homepage = "https://github.com/sile/erldash"
